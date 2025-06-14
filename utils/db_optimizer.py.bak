@@ -1,0 +1,474 @@
+"""
+Database optimization utilities for Blaze Analyst.
+Provides tools for creating indexes, query optimization, and performance monitoring.
+"""
+import logging
+import time
+import asyncio
+from typing import Dict, List, Any, Optional, Tuple, Union
+from datetime import datetime
+import pymongo
+from pymongo import IndexModel, ASCENDING, DESCENDING
+from pymongo.errors import OperationFailure
+
+from ..services.database import db_service
+
+logger = logging.getLogger(__name__)
+
+# Models that need indexing
+INDEX_CONFIGURATIONS = {
+    "User": [
+        {"keys": [("telegram_id", ASCENDING)], "unique": True},
+        {"keys": [("username", ASCENDING)]},
+        {"keys": [("subscription_tier", ASCENDING), ("registration_date", DESCENDING)]}
+    ],
+    "Contract": [
+        {"keys": [("address", ASCENDING)], "unique": True},
+        {"keys": [("risk_level", ASCENDING), ("analysis_date", DESCENDING)]},
+        {"keys": [("name", ASCENDING)]},
+        {"keys": [("symbol", ASCENDING)]},
+        {"keys": [("contract_type", ASCENDING), ("analysis_date", DESCENDING)]}
+    ],
+    "ScanResult": [
+        {"keys": [("address", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("timestamp", DESCENDING)]},
+        {"keys": [("risk_level", ASCENDING), ("timestamp", DESCENDING)]}
+    ],
+    "Alert": [
+        {"keys": [("user_id", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("contract_address", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("severity", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("is_read", ASCENDING), ("timestamp", DESCENDING)]}
+    ],
+    "Transaction": [
+        {"keys": [("address", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("transaction_type", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("timestamp", DESCENDING)]}
+    ],
+    "LogEntry": [
+        {"keys": [("timestamp", DESCENDING)]},
+        {"keys": [("level", ASCENDING), ("timestamp", DESCENDING)]},
+        {"keys": [("source", ASCENDING), ("timestamp", DESCENDING)]}
+    ]
+}
+
+# TTL indexes for auto-expiration
+TTL_INDEXES = {
+    "ScanResult": [
+        {"keys": [("timestamp", ASCENDING)], "ttl": 86400 * 7}  # 7 days TTL
+    ],
+    "LogEntry": [
+        {"keys": [("timestamp", ASCENDING)], "ttl": 86400 * 30}  # 30 days TTL
+    ]
+}
+
+class DatabaseOptimizer:
+    """
+    Database optimization tools for improving query performance.
+    """
+    
+    def __init__(self):
+        """Initialize the database optimizer."""
+        self.query_stats = {}
+        self.is_monitoring = False
+        self.monitor_task = None
+    
+    async def create_indexes(self) -> Dict[str, List[str]]:
+        """
+        Create all configured indexes.
+        
+        Returns:
+            Dict: Created indexes by model
+        """
+        if not db_service.client:
+            logger.error("Database service not connected")
+            return {}
+        
+        created_indexes = {}
+        
+        # Create regular indexes
+        for model_name, indexes in INDEX_CONFIGURATIONS.items():
+            created = []
+            
+            for index_config in indexes:
+                keys = index_config["keys"]
+                unique = index_config.get("unique", False)
+                sparse = index_config.get("sparse", False)
+                background = index_config.get("background", True)
+                
+                success = db_service.create_index(
+                    model_name, 
+                    keys=keys, 
+                    unique=unique, 
+                    sparse=sparse, 
+                    background=background
+                )
+                
+                if success:
+                    key_names = [f"{k[0]}_{k[1]}" for k in keys]
+                    index_name = "_".join(key_names)
+                    created.append(index_name)
+            
+            created_indexes[model_name] = created
+        
+        # Create TTL indexes
+        for model_name, indexes in TTL_INDEXES.items():
+            if model_name not in created_indexes:
+                created_indexes[model_name] = []
+            
+            collection = db_service._get_collection(model_name)
+            
+            for index_config in indexes:
+                keys = index_config["keys"]
+                ttl = index_config["ttl"]
+                
+                try:
+                    key_dict = {k[0]: k[1] for k in keys}
+                    collection.create_index(
+                        [(k, v) for k, v in key_dict.items()],
+                        expireAfterSeconds=ttl,
+                        background=True
+                    )
+                    
+                    key_names = [f"{k[0]}_{k[1]}" for k in keys]
+                    index_name = "_".join(key_names) + f"_ttl_{ttl}"
+                    created_indexes[model_name].append(index_name)
+                    
+                    logger.info(f"Created TTL index on {model_name}.{key_dict} with TTL {ttl}s")
+                except Exception as e:
+                    logger.error(f"Failed to create TTL index on {model_name}: {e}")
+        
+        return created_indexes
+    
+    async def get_collection_stats(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get statistics for all collections.
+        
+        Returns:
+            Dict: Collection statistics
+        """
+        if not db_service.client:
+            logger.error("Database service not connected")
+            return {}
+        
+        stats = {}
+        
+        for model_name in INDEX_CONFIGURATIONS.keys():
+            collection = db_service._get_collection(model_name)
+            
+            try:
+                coll_stats = db_service.db.command("collStats", collection.name)
+                
+                # Extract relevant stats
+                stats[model_name] = {
+                    "count": coll_stats.get("count", 0),
+                    "size_mb": round(coll_stats.get("size", 0) / (1024 * 1024), 2),
+                    "avg_obj_size_bytes": coll_stats.get("avgObjSize", 0),
+                    "storage_size_mb": round(coll_stats.get("storageSize", 0) / (1024 * 1024), 2),
+                    "index_size_mb": round(coll_stats.get("totalIndexSize", 0) / (1024 * 1024), 2),
+                    "indexes": coll_stats.get("nindexes", 0)
+                }
+            except Exception as e:
+                logger.error(f"Failed to get stats for {model_name}: {e}")
+                stats[model_name] = {"error": str(e)}
+        
+        return stats
+    
+    async def get_index_info(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get information about indexes for all collections.
+        
+        Returns:
+            Dict: Index information by model
+        """
+        if not db_service.client:
+            logger.error("Database service not connected")
+            return {}
+        
+        index_info = {}
+        
+        for model_name in INDEX_CONFIGURATIONS.keys():
+            collection = db_service._get_collection(model_name)
+            
+            try:
+                indexes = list(collection.list_indexes())
+                
+                # Format index info
+                formatted_indexes = []
+                for index in indexes:
+                    formatted_indexes.append({
+                        "name": index.get("name"),
+                        "keys": index.get("key"),
+                        "unique": index.get("unique", False),
+                        "sparse": index.get("sparse", False),
+                        "ttl": index.get("expireAfterSeconds")
+                    })
+                
+                index_info[model_name] = formatted_indexes
+            except Exception as e:
+                logger.error(f"Failed to get index info for {model_name}: {e}")
+                index_info[model_name] = []
+        
+        return index_info
+    
+    async def optimize_collection(self, model_name: str) -> Dict[str, Any]:
+        """
+        Optimize a specific collection.
+        
+        Args:
+            model_name: Model name
+            
+        Returns:
+            Dict: Optimization results
+        """
+        if not db_service.client:
+            logger.error("Database service not connected")
+            return {"error": "Database not connected"}
+        
+        results = {}
+        
+        try:
+            # Get collection
+            collection = db_service._get_collection(model_name)
+            
+            # Run explain on common queries to check index usage
+            if model_name == "Contract":
+                explain_queries = [
+                    {"address": "sample_address"},
+                    {"risk_level": "high"},
+                    {"contract_type": "token", "risk_level": "medium"}
+                ]
+                
+                results["query_analysis"] = []
+                
+                for query in explain_queries:
+                    try:
+                        explanation = collection.find(query).explain()
+                        winning_plan = explanation.get("queryPlanner", {}).get("winningPlan", {})
+                        stage = winning_plan.get("stage", "")
+                        index_name = None
+                        
+                        if "IXSCAN" in stage:
+                            index_name = winning_plan.get("inputStage", {}).get("indexName")
+                        
+                        results["query_analysis"].append({
+                            "query": query,
+                            "using_index": "IXSCAN" in stage,
+                            "index_name": index_name,
+                            "stage": stage
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to explain query {query} on {model_name}: {e}")
+            
+            # Compact collection
+            try:
+                compact_result = db_service.db.command("compact", collection.name)
+                results["compact"] = compact_result
+            except OperationFailure as e:
+                # Some storage engines don't support compact
+                results["compact"] = {"error": str(e)}
+            
+            return results
+        except Exception as e:
+            logger.error(f"Failed to optimize collection {model_name}: {e}")
+            return {"error": str(e)}
+    
+    async def start_query_monitoring(self, interval: int = 300) -> None:
+        """
+        Start monitoring database queries.
+        
+        Args:
+            interval: Monitoring interval in seconds
+        """
+        if self.is_monitoring:
+            return
+        
+        self.is_monitoring = True
+        self.monitor_task = asyncio.create_task(self._query_monitor_loop(interval))
+        logger.info(f"Started database query monitoring at {interval}s interval")
+    
+    async def stop_query_monitoring(self) -> None:
+        """Stop database query monitoring."""
+        if not self.is_monitoring:
+            return
+        
+        self.is_monitoring = False
+        
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                pass
+            
+            self.monitor_task = None
+        
+        logger.info("Stopped database query monitoring")
+    
+    async def _query_monitor_loop(self, interval: int) -> None:
+        """
+        Monitor database queries periodically.
+        
+        Args:
+            interval: Monitoring interval in seconds
+        """
+        while self.is_monitoring:
+            try:
+                # Collect query stats
+                await self._collect_query_stats()
+                
+                # Wait for next interval
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in query monitoring: {e}")
+                await asyncio.sleep(60)  # Shorter interval on error
+    
+    async def _collect_query_stats(self) -> None:
+        """Collect query statistics from the database."""
+        if not db_service.client:
+            return
+        
+        try:
+            # Get server status
+            server_status = db_service.client.admin.command("serverStatus")
+            
+            # Get query statistics
+            query_stats = {
+                "timestamp": datetime.now().isoformat(),
+                "operations": {
+                    "insert": server_status.get("opcounters", {}).get("insert", 0),
+                    "query": server_status.get("opcounters", {}).get("query", 0),
+                    "update": server_status.get("opcounters", {}).get("update", 0),
+                    "delete": server_status.get("opcounters", {}).get("delete", 0),
+                    "getmore": server_status.get("opcounters", {}).get("getmore", 0)
+                },
+                "connections": {
+                    "current": server_status.get("connections", {}).get("current", 0),
+                    "available": server_status.get("connections", {}).get("available", 0)
+                },
+                "network": {
+                    "bytes_in": server_status.get("network", {}).get("bytesIn", 0),
+                    "bytes_out": server_status.get("network", {}).get("bytesOut", 0)
+                }
+            }
+            
+            # Store in query stats history
+            self.query_stats[query_stats["timestamp"]] = query_stats
+            
+            # Keep only the last 24 hours of stats
+            timestamps = list(self.query_stats.keys())
+            if len(timestamps) > 24 * 12:  # 24 hours of 5-minute intervals
+                for old_ts in timestamps[:-24*12]:
+                    del self.query_stats[old_ts]
+            
+            # Log slow queries if available
+            if db_service.db.name in db_service.client.list_database_names():
+                try:
+                    slow_queries = list(db_service.client[db_service.db.name].system.profile.find(
+                        {"millis": {"$gt": 100}},  # Queries taking more than 100ms
+                        sort=[("ts", pymongo.DESCENDING)],
+                        limit=5
+                    ))
+                    
+                    if slow_queries:
+                        logger.warning(f"Detected {len(slow_queries)} slow queries")
+                        for query in slow_queries:
+                            logger.warning(f"Slow query: {query.get('ns')}, {query.get('millis')}ms, {query.get('op')}: {query.get('query')}")
+                except Exception as e:
+                    logger.error(f"Failed to get slow queries: {e}")
+        except Exception as e:
+            logger.error(f"Error collecting query stats: {e}")
+    
+    def get_query_stats(self) -> Dict[str, Any]:
+        """
+        Get collected query statistics.
+        
+        Returns:
+            Dict: Query statistics
+        """
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "monitoring": self.is_monitoring,
+            "stats_count": len(self.query_stats),
+            "stats": list(self.query_stats.values())[-10:]  # Return the latest 10 stats
+        }
+    
+    def get_optimization_recommendations(self) -> List[Dict[str, Any]]:
+        """
+        Get recommendations for database optimization.
+        
+        Returns:
+            List[Dict]: Optimization recommendations
+        """
+        recommendations = []
+        
+        if not db_service.client:
+            recommendations.append({
+                "type": "error",
+                "message": "Database not connected",
+                "recommendation": "Check database connection settings"
+            })
+            return recommendations
+        
+        # Check for collection sizes
+        for model_name in INDEX_CONFIGURATIONS.keys():
+            try:
+                collection = db_service._get_collection(model_name)
+                count = collection.count_documents({})
+                
+                # Large collections need indexes
+                if count > 10000:
+                    recommendations.append({
+                        "type": "index",
+                        "collection": model_name,
+                        "message": f"Large collection ({count} documents)",
+                        "recommendation": "Ensure proper indexes exist for common queries"
+                    })
+                
+                # Check for missing indexes from our configurations
+                if count > 1000:
+                    existing_indexes = [idx["name"] for idx in collection.list_indexes()]
+                    
+                    for index_config in INDEX_CONFIGURATIONS.get(model_name, []):
+                        keys = index_config["keys"]
+                        key_dict = {k[0]: k[1] for k in keys}
+                        key_names = "_".join([f"{k}" for k, v in key_dict.items()])
+                        
+                        # Check if a similar index exists
+                        found = False
+                        for existing in existing_indexes:
+                            if key_names in existing:
+                                found = True
+                                break
+                        
+                        if not found:
+                            recommendations.append({
+                                "type": "missing_index",
+                                "collection": model_name,
+                                "message": f"Missing index on {key_names}",
+                                "recommendation": f"Create index on {key_dict}"
+                            })
+            except Exception as e:
+                logger.error(f"Error generating recommendations for {model_name}: {e}")
+        
+        return recommendations
+
+# Create singleton instance
+db_optimizer = DatabaseOptimizer()
+
+async def initialize_optimizer() -> None:
+    """Initialize the database optimizer."""
+    # Create indexes
+    await db_optimizer.create_indexes()
+    
+    # Start query monitoring
+    await db_optimizer.start_query_monitoring()
+    
+    logger.info("Database optimizer initialized")
+
+async def shutdown_optimizer() -> None:
+    """Shutdown the database optimizer."""
+    await db_optimizer.stop_query_monitoring()
+    logger.info("Database optimizer shutdown") 

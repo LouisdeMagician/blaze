@@ -1,0 +1,651 @@
+"""
+Helius API client for advanced Solana data.
+Provides enhanced blockchain data access beyond basic RPC functionality.
+"""
+import logging
+import time
+import json
+import random
+import os
+from typing import Dict, List, Any, Optional, Union, Tuple
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+
+from config.config import config
+from src.services.cache_service import memory_cache
+
+logger = logging.getLogger(__name__)
+
+class HeliusClientError(Exception):
+    """Base exception for Helius client errors."""
+    pass
+
+
+class RateLimitExceededError(HeliusClientError):
+    """Exception for when rate limit is exceeded."""
+    pass
+
+
+class HeliusClient:
+    """Client for the Helius API with advanced Solana data capabilities."""
+    
+    def __init__(self):
+        """Initialize the Helius client."""
+        self.api_key = config.get("blockchain", {}).get("helius_api_key", "")
+        # If not in config, try to get from environment directly
+        if not self.api_key:
+            self.api_key = os.environ.get("HELIUS_API_KEY", "")
+            if self.api_key:
+                logger.info("Loaded Helius API key from environment variable")
+                
+        self.base_url = config.get("helius", {}).get("base_url", "https://api.helius.xyz")
+        self.rpc_url = f"https://mainnet.helius-rpc.com/?api-key={self.api_key}"
+        self.session = None
+        self.request_count = 0
+        self.last_reset = time.time()
+        self.rate_limit = 50  # Default rate limit per minute
+        self.max_retries = 3
+        self.retry_delay = 2.0
+        self.initialized = False
+    
+    async def initialize(self):
+        """Initialize the client session."""
+        if not self.initialized:
+            if not self.api_key:
+                logger.error("Helius API key not found. API calls will fail.")
+            
+            self.session = aiohttp.ClientSession()
+            self.initialized = True
+            logger.info("Helius client initialized")
+            
+            if self.api_key:
+                logger.info(f"Using Helius API key: {self.api_key[:5]}...{self.api_key[-4:]}")
+    
+    async def close(self):
+        """Close the client session."""
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.initialized = False
+            logger.info("Helius client closed")
+    
+    async def _make_request(self, endpoint: str, method: str, 
+                           params: Optional[Dict[str, Any]] = None,
+                           data: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Make a request to the Helius API.
+        
+        Args:
+            endpoint: API endpoint
+            method: HTTP method
+            params: Query parameters
+            data: Request body
+            
+        Returns:
+            Any: Response data
+        """
+        if not self.initialized:
+            await self.initialize()
+        
+        # Check if we're rate limited
+        current_time = time.time()
+        if current_time - self.last_reset > 60:
+            self.request_count = 0
+            self.last_reset = current_time
+            
+        if self.request_count >= self.rate_limit:
+            logger.warning("Rate limit exceeded for Helius API")
+            raise RateLimitExceededError("Rate limit exceeded for Helius API")
+        
+        # Construct the URL
+        url = f"{self.base_url}/{endpoint}"
+        
+        # Add API key to query params
+        query_params = params or {}
+        if "api-key" not in query_params and "apiKey" not in query_params:
+            query_params["api-key"] = self.api_key
+        
+        # Make the request with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Add jitter to avoid thundering herd
+                if attempt > 0:
+                    jitter = random.uniform(0.5, 1.5)
+                    await asyncio.sleep(self.retry_delay * attempt * jitter)
+                
+                async with self.session.request(
+                    method=method,
+                    url=url,
+                    params=query_params,
+                    json=data,
+                    timeout=30
+                ) as response:
+                    self.request_count += 1
+                    
+                    if response.status == 429:
+                        logger.warning("Rate limit exceeded for Helius API")
+                        raise RateLimitExceededError("Rate limit exceeded for Helius API")
+                    
+                    response.raise_for_status()
+                    return await response.json()
+                    
+            except RateLimitExceededError:
+                # Don't retry on rate limit errors
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"Request attempt {attempt+1} failed: {e}")
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Failed after {self.max_retries} attempts: {e}")
+                    raise HeliusClientError(f"Request failed: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                raise HeliusClientError(f"Unexpected error: {e}")
+        
+        return None
+    
+    async def _make_rpc_request(self, method: str, params: List[Any] = None) -> Any:
+        """
+        Make an RPC request to the Helius RPC API.
+        
+        Args:
+            method: RPC method
+            params: RPC parameters
+            
+        Returns:
+            Any: Response data
+        """
+        if not self.initialized:
+            await self.initialize()
+        
+        # Check if we're rate limited
+        current_time = time.time()
+        if current_time - self.last_reset > 60:
+            self.request_count = 0
+            self.last_reset = current_time
+            
+        if self.request_count >= self.rate_limit:
+            logger.warning("Rate limit exceeded for Helius RPC API")
+            raise RateLimitExceededError("Rate limit exceeded for Helius RPC API")
+        
+        # Construct the request
+        data = {
+            "jsonrpc": "2.0",
+            "id": str(int(time.time() * 1000)),
+            "method": method,
+            "params": params or []
+        }
+        
+        # Make the request with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Add jitter to avoid thundering herd
+                if attempt > 0:
+                    jitter = random.uniform(0.5, 1.5)
+                    await asyncio.sleep(self.retry_delay * attempt * jitter)
+                
+                async with self.session.post(
+                    url=self.rpc_url,
+                    json=data,
+                    timeout=30
+                ) as response:
+                    self.request_count += 1
+                    
+                    if response.status == 429:
+                        logger.warning("Rate limit exceeded for Helius RPC API")
+                        raise RateLimitExceededError("Rate limit exceeded for Helius RPC API")
+                    
+                    response.raise_for_status()
+                    result = await response.json()
+                    
+                    if "error" in result:
+                        error = result["error"]
+                        logger.error(f"RPC error: {error}")
+                        raise HeliusClientError(f"RPC error: {error}")
+                    
+                    return result.get("result")
+                    
+            except RateLimitExceededError:
+                # Don't retry on rate limit errors
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"RPC request attempt {attempt+1} failed: {e}")
+                if attempt == self.max_retries - 1:
+                    logger.error(f"RPC failed after {self.max_retries} attempts: {e}")
+                    raise HeliusClientError(f"RPC request failed: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected RPC error: {e}")
+                raise HeliusClientError(f"Unexpected RPC error: {e}")
+        
+        return None
+    
+    async def get_token_data(self, token_address: str) -> Dict[str, Any]:
+        """
+        Get comprehensive token data from Helius.
+        
+        Args:
+            token_address: Token mint address
+            
+        Returns:
+            Dict: Token data
+        """
+        try:
+            # Check cache first
+            cache_key = f"token_data:{token_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            endpoint = f"v0/tokens/metadata?mintAccounts=[{token_address}]"
+            result = await self._make_request(endpoint, "GET")
+            
+            if not result or not isinstance(result, list) or len(result) == 0:
+                return None
+                
+            token_data = result[0]
+            
+            # Enhance with additional data if available
+            try:
+                additional_data = await self.get_token_price_data(token_address)
+                if additional_data:
+                    token_data["price"] = additional_data
+            except Exception as e:
+                logger.warning(f"Could not fetch price data: {e}")
+            
+            # Cache the result
+            await memory_cache.set(cache_key, token_data, 300)  # Cache for 5 minutes
+            
+            return token_data
+            
+        except Exception as e:
+            logger.error(f"Error getting token data for {token_address}: {e}")
+            return None
+    
+    async def get_token_holders(self, token_address: str, limit: int = 100, 
+                               offset: int = 0) -> List[Dict[str, Any]]:
+        """
+        Get token holders data from Helius.
+        
+        Args:
+            token_address: Token mint address
+            limit: Maximum number of holders to return
+            offset: Offset for pagination
+            
+        Returns:
+            List[Dict]: List of token holders with holdings
+        """
+        try:
+            # Check cache first
+            cache_key = f"token_holders:{token_address}:{limit}:{offset}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # This is a hypothetical endpoint - adjust based on actual Helius API
+            endpoint = f"v0/tokens/{token_address}/holders"
+            params = {
+                "limit": limit,
+                "offset": offset
+            }
+            
+            result = await self._make_request(endpoint, "GET", params=params)
+            
+            if not result or "holders" not in result:
+                return []
+            
+            holders = result["holders"]
+            
+            # Cache the result
+            await memory_cache.set(cache_key, holders, 300)  # Cache for 5 minutes
+            
+            return holders
+            
+        except Exception as e:
+            logger.error(f"Error getting token holders for {token_address}: {e}")
+            return []
+    
+    async def get_token_price_data(self, token_address: str) -> Dict[str, Any]:
+        """
+        Get token price data from Helius.
+        
+        Args:
+            token_address: Token mint address
+            
+        Returns:
+            Dict: Token price data
+        """
+        try:
+            # Check cache first
+            cache_key = f"token_price:{token_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # Check if Helius price API is available
+            # For now, use Jupiter API or other sources
+            
+            # Placeholder data
+            price_data = {
+                "price": None,
+                "change_24h": None,
+                "volume_24h": None,
+                "last_updated": int(time.time())
+            }
+            
+            # Cache the result
+            await memory_cache.set(cache_key, price_data, 300)  # Cache for 5 minutes
+            
+            return price_data
+            
+        except Exception as e:
+            logger.error(f"Error getting token price for {token_address}: {e}")
+            return None
+    
+    async def get_token_supply(self, token_address: str) -> int:
+        """
+        Get token supply from Helius.
+        
+        Args:
+            token_address: Token mint address
+            
+        Returns:
+            int: Token supply
+        """
+        try:
+            # Check cache first
+            cache_key = f"token_supply:{token_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data is not None:
+                return cached_data
+            
+            # Fetch the token metadata which includes supply
+            token_data = await self.get_token_data(token_address)
+            if token_data and "supply" in token_data:
+                supply = token_data["supply"]
+                
+                # Cache the result
+                await memory_cache.set(cache_key, supply, 3600)  # Cache for 1 hour
+                
+                return supply
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error getting token supply for {token_address}: {e}")
+            return 0
+    
+    async def get_historical_transactions(self, address: str, 
+                                         limit: int = 50,
+                                         before: Optional[str] = None,
+                                         days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Get historical transactions for an address.
+        
+        Args:
+            address: Token or wallet address
+            limit: Maximum number of transactions to return
+            before: Transaction signature to fetch transactions before
+            days: Number of days to look back (max 30)
+            
+        Returns:
+            List[Dict]: List of transactions
+        """
+        try:
+            # Check cache first
+            cache_key = f"historical_tx:{address}:{limit}:{before}:{days}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # Limit days to 30 max
+            days = min(days, 30)
+            
+            endpoint = f"v0/addresses/{address}/transactions"
+            params = {
+                "limit": limit,
+                "type": "all"
+            }
+            
+            if before:
+                params["before"] = before
+                
+            result = await self._make_request(endpoint, "GET", params=params)
+            
+            if not result or not isinstance(result, list):
+                return []
+            
+            # Filter by date if needed
+            if days > 0:
+                cutoff_date = datetime.now() - timedelta(days=days)
+                cutoff_timestamp = int(cutoff_date.timestamp())
+                
+                result = [tx for tx in result if tx.get("timestamp", 0) >= cutoff_timestamp]
+            
+            # Cache the result
+            await memory_cache.set(cache_key, result, 300)  # Cache for 5 minutes
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting historical transactions for {address}: {e}")
+            return []
+    
+    async def get_historical_price_data(self, token_address: str, 
+                                       days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Get historical price data for a token.
+        
+        Args:
+            token_address: Token mint address
+            days: Number of days to look back
+            
+        Returns:
+            List[Dict]: List of price points
+        """
+        try:
+            # Check cache first
+            cache_key = f"historical_price:{token_address}:{days}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # This endpoint doesn't actually exist in Helius - we would need to use
+            # another API or aggregate data from DEXes
+            
+            # Placeholder data
+            price_points = []
+            now = datetime.now()
+            
+            for i in range(days):
+                date = now - timedelta(days=i)
+                price_points.append({
+                    "timestamp": int(date.timestamp()),
+                    "price": None,
+                    "volume": None
+                })
+            
+            # Sort by timestamp ascending
+            price_points.sort(key=lambda x: x["timestamp"])
+            
+            # Cache the result
+            await memory_cache.set(cache_key, price_points, 3600)  # Cache for 1 hour
+            
+            return price_points
+            
+        except Exception as e:
+            logger.error(f"Error getting historical price data for {token_address}: {e}")
+            return []
+    
+    async def get_token_transfers(self, token_address: str, 
+                                 limit: int = 50,
+                                 days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Get token transfer events.
+        
+        Args:
+            token_address: Token mint address
+            limit: Maximum number of transfers to return
+            days: Number of days to look back
+            
+        Returns:
+            List[Dict]: List of transfer events
+        """
+        try:
+            # Check cache first
+            cache_key = f"token_transfers:{token_address}:{limit}:{days}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # Get historical transactions for the token
+            transactions = await self.get_historical_transactions(
+                token_address, limit=limit, days=days
+            )
+            
+            # Filter for transfer instructions only
+            transfers = []
+            for tx in transactions:
+                # Extract transfer events
+                for instruction in tx.get("instructions", []):
+                    # Check if it's a transfer instruction
+                    if instruction.get("name") == "Transfer" or instruction.get("name") == "TransferChecked":
+                        transfers.append({
+                            "signature": tx.get("signature"),
+                            "timestamp": tx.get("timestamp"),
+                            "from": instruction.get("accounts", [{}])[0].get("address"),
+                            "to": instruction.get("accounts", [{}])[1].get("address"),
+                            "amount": instruction.get("data", {}).get("amount", 0)
+                        })
+            
+            # Cache the result
+            await memory_cache.set(cache_key, transfers, 300)  # Cache for 5 minutes
+            
+            return transfers
+            
+        except Exception as e:
+            logger.error(f"Error getting token transfers for {token_address}: {e}")
+            return []
+    
+    async def get_nft_metadata(self, nft_address: str) -> Dict[str, Any]:
+        """
+        Get NFT metadata from Helius.
+        
+        Args:
+            nft_address: NFT mint address
+            
+        Returns:
+            Dict: NFT metadata
+        """
+        try:
+            # Check cache first
+            cache_key = f"nft_metadata:{nft_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            endpoint = f"v0/tokens/metadata?mintAccounts=[{nft_address}]"
+            result = await self._make_request(endpoint, "GET")
+            
+            if not result or not isinstance(result, list) or len(result) == 0:
+                return None
+            
+            nft_data = result[0]
+            
+            # Cache the result
+            await memory_cache.set(cache_key, nft_data, 3600)  # Cache for 1 hour
+            
+            return nft_data
+            
+        except Exception as e:
+            logger.error(f"Error getting NFT metadata for {nft_address}: {e}")
+            return None
+    
+    async def get_dex_info(self, token_address: str) -> Dict[str, Any]:
+        """
+        Get DEX information for a token from Helius.
+        
+        Args:
+            token_address: Token mint address
+            
+        Returns:
+            Dict: DEX information
+        """
+        try:
+            # Check cache first
+            cache_key = f"dex_info:{token_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            # Helius doesn't directly provide DEX info
+            # We can use Jupiter API or other sources
+            
+            # Placeholder data
+            dex_info = {
+                "pools": [],
+                "total_liquidity": 0,
+                "last_updated": int(time.time())
+            }
+            
+            # Cache the result
+            await memory_cache.set(cache_key, dex_info, 300)  # Cache for 5 minutes
+            
+            return dex_info
+            
+        except Exception as e:
+            logger.error(f"Error getting DEX info for {token_address}: {e}")
+            return None
+    
+    async def get_wallet_balance(self, wallet_address: str) -> Dict[str, Any]:
+        """
+        Get wallet token balances.
+        
+        Args:
+            wallet_address: Wallet address
+            
+        Returns:
+            Dict: Wallet balance information
+        """
+        try:
+            # Check cache first
+            cache_key = f"wallet_balance:{wallet_address}"
+            cached_data = await memory_cache.get(cache_key)
+            if cached_data:
+                return cached_data
+            
+            endpoint = f"v0/addresses/{wallet_address}/balances"
+            result = await self._make_request(endpoint, "GET")
+            
+            if not result:
+                return {
+                    "tokens": [],
+                    "nfts": [],
+                    "sol": 0
+                }
+            
+            # Cache the result
+            await memory_cache.set(cache_key, result, 60)  # Cache for 1 minute (balances change frequently)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting wallet balance for {wallet_address}: {e}")
+            return {
+                "tokens": [],
+                "nfts": [],
+                "sol": 0
+            }
+
+# Singleton instance
+helius_client = HeliusClient() 
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting wallet balance for {wallet_address}: {e}")
+            return {
+                "tokens": [],
+                "nfts": [],
+                "sol": 0
+            }
+
+# Singleton instance
+helius_client = HeliusClient() 
